@@ -8,7 +8,11 @@ width_multiple: 1.0  # layer channel multiple
 activation: nn.ReLU()
 
 # anchors
-anchors: 3
+# anchors: 3
+anchors:
+  - [10,13, 16,30, 33,23]  # P3/8
+  - [30,61, 62,45, 59,119]  # P4/16
+  - [116,90, 156,198, 373,326]  # P5/32
 
 # gelan backbone
 backbone:
@@ -76,5 +80,6 @@ head:
    [-1, 1, RepNCSPELAN4, [512, 512, 256, 1]],  # 21 (P5/32-large)
 
    # detect
-   [[15, 18, 21], 1, DDetect, [nc]],  # Detect(P3, P4, P5)
+   #[[15, 18, 21], 1, DDetect, [nc]],  # Detect(P3, P4, P5)
+   [[15, 18, 21], 1, Detect, [n, anchors]],  # Detect(P3, P4, P5)
   ]
