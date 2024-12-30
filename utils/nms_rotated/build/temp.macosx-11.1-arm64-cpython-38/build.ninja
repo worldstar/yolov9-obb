@@ -1,0 +1,25 @@
+ninja_required_version = 1.3
+cxx = c++
+
+cflags = -Wno-unused-result -Wsign-compare -Wunreachable-code -DNDEBUG -g -fwrapv -O3 -Wall -Wstrict-prototypes -I/opt/anaconda3/envs/yolov9-obb/include -arch arm64 -I/opt/anaconda3/envs/yolov9-obb/include -arch arm64 -I/opt/anaconda3/envs/yolov9-obb/lib/python3.8/site-packages/torch/include -I/opt/anaconda3/envs/yolov9-obb/lib/python3.8/site-packages/torch/include/torch/csrc/api/include -I/opt/anaconda3/envs/yolov9-obb/lib/python3.8/site-packages/torch/include/TH -I/opt/anaconda3/envs/yolov9-obb/lib/python3.8/site-packages/torch/include/THC -I/opt/anaconda3/envs/yolov9-obb/include/python3.8 -c
+post_cflags = -DTORCH_API_INCLUDE_EXTENSION_H '-DPYBIND11_COMPILER_TYPE="_clang"' '-DPYBIND11_STDLIB="_libcpp"' '-DPYBIND11_BUILD_ABI="_cxxabi1002"' -DTORCH_EXTENSION_NAME=nms_rotated_ext -D_GLIBCXX_USE_CXX11_ABI=0 -std=c++17
+cuda_dlink_post_cflags = 
+ldflags = 
+
+rule compile
+  command = $cxx -MMD -MF $out.d $cflags -c $in -o $out $post_cflags
+  depfile = $out.d
+  deps = gcc
+
+
+
+
+
+build /Users/kao900531/yolov9-obb/utils/nms_rotated/build/temp.macosx-11.1-arm64-cpython-38/src/nms_rotated_cpu.o: compile /Users/kao900531/yolov9-obb/utils/nms_rotated/src/nms_rotated_cpu.cpp
+build /Users/kao900531/yolov9-obb/utils/nms_rotated/build/temp.macosx-11.1-arm64-cpython-38/src/nms_rotated_ext.o: compile /Users/kao900531/yolov9-obb/utils/nms_rotated/src/nms_rotated_ext.cpp
+
+
+
+
+
+
