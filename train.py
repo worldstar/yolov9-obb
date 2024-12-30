@@ -30,15 +30,16 @@ from utils.autobatch import check_train_batch_size
 from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.downloads import attempt_download, is_url
-from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, check_file, check_img_size,
+from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, check_file, check_img_size, check_requirements, check_git_status,
                            check_suffix, check_yaml, colorstr, get_latest_run, increment_path, init_seeds,
                            intersect_dicts, labels_to_class_weights, labels_to_image_weights, methods,
                            one_cycle, one_flat_cycle, print_args, print_mutation, strip_optimizer, yaml_save)
 from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
-from utils.loss_tal import ComputeLoss
+from utils.loss import ComputeLoss_NEW as ComputeLoss
+#from utils.loss_tal import ComputeLoss
 from utils.metrics import fitness
-from utils.plots import plot_evolve
+from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP,
                                smart_optimizer, smart_resume, torch_distributed_zero_first)
 
@@ -53,7 +54,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
-
+    
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
@@ -64,6 +65,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if isinstance(hyp, str):
         with open(hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
+            #print("Loaded hyp:", hyp)
     LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     hyp['anchor_t'] = 5.0
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
@@ -113,9 +115,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         model.load_state_dict(csd, strict=False)  # load
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
+        #print("Hyp content:", hyp)
+        #print("Anchors from hyp:", hyp.get('anchors'), type(hyp.get('anchors')))
+        #anchors = hyp.get('anchors')
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = check_amp(model)  # check AMP
-
+    
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
@@ -178,6 +183,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               imgsz,
                                               batch_size // WORLD_SIZE,
                                               gs,
+                                              names,
                                               single_cls,
                                               hyp=hyp,
                                               augment=True,
@@ -201,6 +207,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        imgsz,
                                        batch_size // WORLD_SIZE * 2,
                                        gs,
+                                       names,
                                        single_cls,
                                        hyp=hyp,
                                        cache=None if noval else opt.cache,
@@ -210,11 +217,17 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        pad=0.5,
                                        prefix=colorstr('val: '))[0]
 
+        # Anchors
         if not resume:
-            # if not opt.noautoanchor:
-            #     check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
+            labels = np.concatenate(dataset.labels, 0) # labels(array): (all_images_gt_num, [cls_id, poly])
+            
+            if plots:
+                plot_labels(labels, names, save_dir, imgsz)
+            
+            if not opt.noautoanchor:
+                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
-
+    
         callbacks.run('on_pretrain_routine_end', labels, names)
 
     # DDP mode
@@ -226,6 +239,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     #hyp['box'] *= 3 / nl  # scale to layers
     #hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
     #hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    # Add 'theta' reference 'YOLOv5-OBB' 
+    hyp['box'] *= 3 / nl  # scale to layers
+    hyp['cls'] *= nc / 4 * 3 / nl  # scale to classes and layers 80->10
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    hyp['theta'] *= 3 / nl
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
@@ -239,7 +257,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    #results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = (0, 0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls, theta)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
@@ -266,11 +285,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        #mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(4, device=device)  # mean losses
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        #LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box_loss', 'obj_loss', 'cls_loss', 'labels', 'ImageSize', 'theta'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
@@ -296,7 +317,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    # Add 'label_ratio' reference 'YOLOv5-OBB'
+                    label_ratio = float(ns[0]) / imgs.shape[2]
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    # Add 'targets' reference 'YOLOv5-OBB'
+                    targets[:, 2:6] *= label_ratio # targets (tensor): (n_targets, [img_index clsid cx cy l s theta gaussian_θ_labels])
 
             # Forward
             with torch.cuda.amp.autocast(amp):
@@ -325,7 +350,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                #pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                #                     (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                pbar.set_description(('%11s' * 2 + '%11.4g' * 6) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
@@ -415,7 +442,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                         save_dir=save_dir,
                         save_json=is_coco,
                         verbose=True,
-                        plots=plots,
+                        plots=True,
                         callbacks=callbacks,
                         compute_loss=compute_loss)  # val best model with plots
                     if is_coco:
@@ -432,7 +459,7 @@ def parse_opt(known=False):
     # parser.add_argument('--weights', type=str, default=ROOT / 'yolo.pt', help='initial weights path')
     # parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--weights', type=str, default='', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='yolo.yaml', help='model.yaml path')
+    parser.add_argument('--cfg', type=str, default='yolov9.yaml', help='model.yaml path')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='dataset.yaml path')
     parser.add_argument('--hyp', type=str, default=ROOT / 'data/hyps/hyp.scratch-low.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=100, help='total training epochs')
@@ -483,6 +510,8 @@ def main(opt, callbacks=Callbacks()):
     # Checks
     if RANK in {-1, 0}:
         print_args(vars(opt))
+        check_git_status()
+        check_requirements()
 
     # Resume (from specified or most recent last.pt)
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:

@@ -15,9 +15,11 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
 from utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
-                           increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
+                           increment_path, non_max_suppression, non_max_suppression_obb, print_args, scale_boxes, strip_optimizer, xyxy2xywh, scale_polys)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
+from utils.rboxs_utils import poly2rbox, rbox2poly
+
 
 
 @smart_inference_mode()
@@ -99,13 +101,16 @@ def run(
 
         # NMS
         with dt[2]:
-            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
+            #pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+            pred = non_max_suppression_obb(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        
+        
         # Second-stage classifier (optional)
         # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
+            pred_poly = rbox2poly(det[:, :5]) # (n, [x1 y1 x2 y2 x3 y3 x4 y4])
             seen += 1
             if webcam:  # batch_size >= 1
                 p, im0, frame = path[i], im0s[i].copy(), dataset.count
@@ -122,28 +127,35 @@ def run(
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
             if len(det):
                 # Rescale boxes from img_size to im0 size
-                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
-
+                pred_poly = scale_polys(im.shape[2:], pred_poly, im0.shape)
+                #det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                det = torch.cat((pred_poly, det[:, -2:]), dim=1) # (n, [poly conf cls])
+                
                 # Print results
-                for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
+                for c in det[:, -1].unique():
+                    n = (det[:, -1] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for *xyxy, conf, cls in reversed(det):
+                #for *xyxy, conf, cls in reversed(det):
+                for *poly, conf, cls in reversed(det):
                     if save_txt:  # Write to file
-                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                        #xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        poly = poly.tolist()
+                        #line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                        line = (cls, *poly, conf) if save_conf else (cls, *poly)  # label format
                         with open(f'{txt_path}.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
                     if save_img or save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        #annotator.box_label(xyxy, label, color=colors(c, True))
+                        annotator.poly_label(poly, label, color=colors(c, True))
                     if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
-
+                        #save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
+                        pass
+                        
             # Stream results
             im0 = annotator.result()
             if view_img:

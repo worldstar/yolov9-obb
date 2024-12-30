@@ -37,11 +37,12 @@ from utils.general import (LOGGER, TQDM_BAR_FORMAT, check_amp, check_dataset, ch
                            yaml_save, one_flat_cycle)
 from utils.loggers import Loggers
 from utils.loggers.comet.comet_utils import check_comet_resume
+#from utils.loss import ComputeLoss
 from utils.loss_tal_dual import ComputeLoss
 #from utils.loss_tal_dual import ComputeLossLH as ComputeLoss
 #from utils.loss_tal_dual import ComputeLossLHCF as ComputeLoss
 from utils.metrics import fitness
-from utils.plots import plot_evolve
+from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
 
@@ -76,6 +77,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         yaml_save(save_dir / 'opt.yaml', vars(opt))
 
     # Loggers
+    # A tool used to record events, errors, or other messages that occur during the execution of a program.
     data_dict = None
     if RANK in {-1, 0}:
         loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)  # loggers instance
@@ -99,6 +101,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     #is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
+    assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {data}'  # check
     is_coco = isinstance(val_path, str) and val_path.endswith('val2017.txt')  # COCO dataset
 
     # Model
@@ -116,7 +119,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+    # Automatic Mixed Precision (AMP) operates by selectively converting certain floating-point operations from single precision (float32) to half precision (float16). 
     amp = check_amp(model)  # check AMP
+    
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
@@ -189,6 +194,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               imgsz,
                                               batch_size // WORLD_SIZE,
                                               gs,
+                                              names,
                                               single_cls,
                                               hyp=hyp,
                                               augment=True,
@@ -212,6 +218,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        imgsz,
                                        batch_size // WORLD_SIZE * 2,
                                        gs,
+                                       names,
                                        single_cls,
                                        hyp=hyp,
                                        cache=None if noval else opt.cache,
@@ -222,6 +229,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        prefix=colorstr('val: '))[0]
 
         if not resume:
+            labels = np.concatenate(dataset.labels, 0) # labels(array): (all_images_gt_num, [cls_id, poly])
             # if not opt.noautoanchor:
             #     check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
@@ -234,9 +242,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
-    #hyp['box'] *= 3 / nl  # scale to layers
-    #hyp['cls'] *= nc / 80 * 3 / nl  # scale to classes and layers
-    #hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    # Add 'theta' reference 'YOLOv5-OBB' 
+    hyp['box'] *= 3 / nl  # scale to layers
+    hyp['cls'] *= nc / 10 * 3 / nl  # scale to classes and layers 80->10
+    hyp['obj'] *= (imgsz / 640) ** 2 * 3 / nl  # scale to image size and layers
+    hyp['theta'] *= 3 / nl
     hyp['label_smoothing'] = opt.label_smoothing
     model.nc = nc  # attach number of classes to model
     model.hyp = hyp  # attach hyperparameters to model
@@ -250,7 +260,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    # Add 'theta' reference 'YOLOv5-OBB'
+    #results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = (0, 0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls, theta)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
@@ -281,7 +293,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        # Add 'theta' reference 'YOLOv5-OBB'
+        #LOGGER.info(('\n' + '%11s' * 7) % ('Epoch', 'GPU_mem', 'box_loss', 'cls_loss', 'dfl_loss', 'Instances', 'Size'))
+        LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box_loss', 'obj_loss', 'cls_loss', 'labels', 'ImageSize', 'theta'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
@@ -307,7 +321,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 sf = sz / max(imgs.shape[2:])  # scale factor
                 if sf != 1:
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
+                    # Add 'label_ratio' reference 'YOLOv5-OBB'
+                    label_ratio = float(ns[0]) / imgs.shape[2]
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
+                    # Add 'targets' reference 'YOLOv5-OBB'
+                    targets[:, 2:6] *= label_ratio # targets (tensor): (n_targets, [img_index clsid cx cy l s theta gaussian_θ_labels])
 
             # Forward
             with torch.cuda.amp.autocast(amp):
@@ -336,9 +354,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                # Change 5 -> 6 reference 'YOLOv5-OBB'
+                #pbar.set_description(('%11s' * 2 + '%11.4g' * 5) %
+                #                    (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
+                pbar.set_description(('%11s' * 2 + '%11.4g' * 6) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+                # Add 'opt.sync_bn' reference 'YOLOv5-OBB'
+                #callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
+                callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss), opt.sync_bn)
                 if callbacks.stop_training:
                     return
             # end batch ------------------------------------------------------------------------------------------------
@@ -491,8 +514,8 @@ def main(opt, callbacks=Callbacks()):
     # Checks
     if RANK in {-1, 0}:
         print_args(vars(opt))
-        #check_git_status()
-        #check_requirements()
+        check_git_status()
+        check_requirements()
 
     # Resume (from specified or most recent last.pt)
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
@@ -520,7 +543,8 @@ def main(opt, callbacks=Callbacks()):
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
-    # DDP mode
+    # DDP (Distributed Data Parallel) mode
+    # To parallelize data and computation across multiple GPUs or machines to accelerate deep learning tasks.
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLO Multi-GPU DDP training'

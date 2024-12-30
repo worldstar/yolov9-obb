@@ -19,10 +19,11 @@ from utils.callbacks import Callbacks
 from utils.dataloaders import create_dataloader
 from utils.general import (LOGGER, TQDM_BAR_FORMAT, Profile, check_dataset, check_img_size, check_requirements,
                            check_yaml, coco80_to_coco91_class, colorstr, increment_path, non_max_suppression,
-                           print_args, scale_boxes, xywh2xyxy, xyxy2xywh)
+                           print_args, scale_boxes, xywh2xyxy, xyxy2xywh, scale_coords, scale_polys, non_max_suppression_obb)
 from utils.metrics import ConfusionMatrix, ap_per_class, box_iou
 from utils.plots import output_to_target, plot_images, plot_val_study
 from utils.torch_utils import select_device, smart_inference_mode
+from utils.rboxs_utils import poly2hbb, rbox2poly
 
 
 def save_one_txt(predn, save_conf, shape, file):
@@ -35,17 +36,31 @@ def save_one_txt(predn, save_conf, shape, file):
             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
 
-def save_one_json(predn, jdict, path, class_map):
+#def save_one_json(predn, jdict, path, class_map):
+def save_one_json(pred_hbbn, pred_polyn, jdict, path, class_map):
+    """
+    Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236, "poly": [...]}
+    Args:
+        pred_hbbn (tensor): (n, [poly, conf, cls]) 
+        pred_polyn (tensor): (n, [xyxy, conf, cls])
+    """
     # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
     image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-    box = xyxy2xywh(predn[:, :4])  # xywh
+    #box = xyxy2xywh(predn[:, :4])  # xywh
+    box = xyxy2xywh(pred_hbbn[:, :4])  # xywh
     box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-    for p, b in zip(predn.tolist(), box.tolist()):
+    #for p, b in zip(predn.tolist(), box.tolist()):
+    for p, b in zip(pred_polyn.tolist(), box.tolist()):
         jdict.append({
             'image_id': image_id,
-            'category_id': class_map[int(p[5])],
-            'bbox': [round(x, 3) for x in b],
-            'score': round(p[4], 5)})
+            #'category_id': class_map[int(p[5])],
+            'category_id': class_map[int(p[-1]) + 1], # COCO's category_id start from 1, not 0
+            #'bbox': [round(x, 3) for x in b],
+            'bbox': [round(x, 1) for x in b],
+            #'score': round(p[4], 5)},
+            'score': round(p[-2], 5),         
+            'poly': [round(x, 1) for x in p[:8]],
+            'file_name': path.stem})
 
 
 def process_batch(detections, labels, iouv):
@@ -169,10 +184,12 @@ def run(
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
-    s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
+    #s = ('%22s' + '%11s' * 6) % ('Class', 'Images', 'Instances', 'P', 'R', 'mAP50', 'mAP50-95')
+    s = ('%20s' + '%11s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'HBBmAP@.5', '  HBBmAP@.5:.95')
     tp, fp, p, r, f1, mp, mr, map50, ap50, map = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     dt = Profile(), Profile(), Profile()  # profiling times
-    loss = torch.zeros(3, device=device)
+    #loss = torch.zeros(3, device=device)
+    loss = torch.zeros(4, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
     callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
@@ -189,15 +206,19 @@ def run(
         # Inference
         with dt[1]:
             preds, train_out = model(im) if compute_loss else (model(im, augment=augment), None)
+            
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            #loss += compute_loss(train_out, targets)[1]  # box, obj, cls
+            loss += compute_loss([x.float() for x in train_out], targets)[1]  # box, obj, cls, theta
 
         # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+        #targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
+
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
         with dt[2]:
+            """
             preds = non_max_suppression(preds,
                                         conf_thres,
                                         iou_thres,
@@ -205,54 +226,150 @@ def run(
                                         multi_label=True,
                                         agnostic=single_cls,
                                         max_det=max_det)
+            """
+            '''
+            # Function to convert and pad data into tensors
+            def convert_and_pad(data):
+                if isinstance(data, torch.Tensor):  # Already a tensor, return it
+                    return data
+                elif isinstance(data, np.ndarray) or isinstance(data, list):  # Convert list or array to tensor
+                    try:
+                        return torch.tensor(data)
+                    except ValueError as e:
+                        print(f"Error converting {data}: {e}")
+                        return None
+                else:
+                    print(f"Unsupported type found: {type(data)}")
+                    return None  # Handle unsupported data types
+
+            # Convert preds list to tensor
+            def process_preds(preds):
+                preds_np = np.asarray(preds, dtype=object)  # Convert to numpy object array first to handle mixed types
+                
+                preds_filtered = []
+                for p in preds_np:
+                    tensor = convert_and_pad(p)  # Convert each element to tensor if possible
+                    if tensor is not None:
+                        preds_filtered.append(tensor)
+
+                if preds_filtered:
+                    # Calculate the maximum shape for padding
+                    max_shape = [max(p.shape[i] for p in preds_filtered) for i in range(len(preds_filtered[0].shape))]
+                    
+                    # Pad tensors to match max_shape
+                    preds_padded = []
+                    for p in preds_filtered:
+                        # Calculate the padding amount for each dimension
+                        padding = [(0, max_dim - dim) for dim, max_dim in zip(p.shape, max_shape)]
+                        # Pad tensors accordingly
+                        preds_padded.append(torch.nn.functional.pad(p, [pad for pair in padding[::-1] for pad in pair]))
+                    
+                    # Stack padded tensors into a single tensor
+                    preds_tensor = torch.stack(preds_padded, dim=0)
+                    return preds_tensor
+                else:
+                    print("No valid tensors found in preds.")
+                    return None
+
+            # Call process_preds to handle your preds list
+            preds_tensor = process_preds(preds)
+
+            if preds_tensor is not None:
+                print(preds_tensor.shape)  # Verify final shape
+            else:
+                print("Predictions could not be processed.")
+            '''
+            preds = non_max_suppression_obb(preds,
+                                            conf_thres,
+                                            iou_thres,
+                                            labels=lb,
+                                            multi_label=True,
+                                            agnostic=single_cls,
+                                            max_det=max_det)
 
         # Metrics
-        for si, pred in enumerate(preds):
-            labels = targets[targets[:, 0] == si, 1:]
+        for si, pred in enumerate(preds):  # image index, detections            
+   
+            if si >= len(shapes):
+                print(f"Index {si} out of range for shapes. shapes length: {len(shapes)}")
+                break  # or continue, depending on the logic
+            path, shape = Path(paths[si]), shapes[si][0]  # Access paths and shapes safely
+            print(f"path: {path}, shape: {shape}")
+
+            
+            #labels = targets[targets[:, 0] == si, 1:]
+            labels = targets[targets[:, 0] == si, 1:7]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
+            tcls = labels[:, 0].tolist() if nl else []  # target class
             path, shape = Path(paths[si]), shapes[si][0]
-            correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
+            #correct = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
 
             if npr == 0:
                 if nl:
-                    stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
+                    #stats.append((correct, *torch.zeros((2, 0), device=device), labels[:, 0]))
+                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
                     if plots:
                         confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
                 continue
 
             # Predictions
             if single_cls:
-                pred[:, 5] = 0
+                #pred[:, 5] = 0
+                pred[:, 6] = 0
+                  
+            poly = rbox2poly(pred[:, :5]) # (n, 8)
+            pred_poly = torch.cat((poly, pred[:, -2:]), dim=1) # (n, [poly, conf, cls])
+            hbbox = xywh2xyxy(poly2hbb(pred_poly[:, :8])) # (n, [x1 y1 x2 y2])
+            pred_hbb = torch.cat((hbbox, pred_poly[:, -2:]), dim=1) # (n, [xyxy, conf, cls]) 
+
+            pred_polyn = pred_poly.clone() # predn (tensor): (n, [poly, conf, cls])
+            scale_polys(im[si].shape[1:], pred_polyn[:, :8], shape, shapes[si][1])  # native-space pred
+            hbboxn = xywh2xyxy(poly2hbb(pred_polyn[:, :8])) # (n, [x1 y1 x2 y2])
+            pred_hbbn = torch.cat((hbboxn, pred_polyn[:, -2:]), dim=1) # (n, [xyxy, conf, cls]) native-space pred    
+                
+            '''
+            #Original Code    
             predn = pred.clone()
             scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-
+            '''
+            
+            
             # Evaluate
             if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                #tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                tpoly = rbox2poly(labels[:, 1:6]) # target poly
+                tbox = xywh2xyxy(poly2hbb(tpoly)) # target  hbb boxes [xyxy]
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct = process_batch(predn, labelsn, iouv)
+                #correct = process_batch(predn, labelsn, iouv)
+                correct = process_batch(pred_hbbn, labelsn, iouv)
                 if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
-
+                    confusion_matrix.process_batch(pred_hbbn, labelsn)
+            else:
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool)
+            #stats.append((correct, pred[:, 4], pred[:, 5], labels[:, 0]))  # (correct, conf, pcls, tcls)
+            stats.append((correct.cpu(), pred_poly[:, 8].cpu(), pred_poly[:, 9].cpu(), tcls))
+            
             # Save/log
             if save_txt:
-                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
+                save_one_txt(pred_hbbn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')            
             if save_json:
-                save_one_json(predn, jdict, path, class_map)  # append to COCO-JSON dictionary
-            callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
+                save_one_json(pred_hbbn, jdict, path, class_map)  # append to COCO-JSON dictionary
+            callbacks.run('on_val_image_end', pred_hbb, pred_hbbn, path, names, im[si])
 
         # Plot images
-        if plots and batch_i < 3:
+        if plots and batch_i < 3:            
+            f = save_dir / f'val_batch{batch_i}_labels.jpg'  # labels
             plot_images(im, targets, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)  # labels
+            f = save_dir / f'val_batch{batch_i}_pred.jpg'  # predictions
             plot_images(im, output_to_target(preds), paths, save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
         callbacks.run('on_val_batch_end', batch_i, im, targets, paths, shapes, preds)
 
     # Compute metrics
-    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
+    #stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
         ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
@@ -260,7 +377,7 @@ def run(
     nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
 
     # Print results
-    pf = '%22s' + '%11i' * 2 + '%11.3g' * 4  # print format
+    pf = '%20s' + '%11i' * 2 + '%11.3g' * 4  # print format
     LOGGER.info(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
     if nt.sum() == 0:
         LOGGER.warning(f'WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels')
