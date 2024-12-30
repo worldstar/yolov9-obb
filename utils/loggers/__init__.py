@@ -219,13 +219,30 @@ class Loggers():
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
         # Callback runs at the end of each fit (train+val) epoch
-        x = dict(zip(self.keys, vals))
+        
+        # Convert tensors to floats
+        #vals = [v.item() if isinstance(v, torch.Tensor) else v for v in vals]
+        vals = [float(v) for v in vals]  # Convert to float
+        
+        # Print vals for debugging
+        print(f"vals: {vals}, epoch: {epoch}")
+
+        # Ensure all elements in vals are numeric (or handle them appropriately)
+        vals = [v if isinstance(v, (int, float)) else 0 for v in vals]  # Replace non-numeric with 0
+
+        #x = dict(zip(self.keys, vals))
+        x = {k: v for k, v in zip(self.keys, vals)}  # dict
         if self.csv:
             file = self.save_dir / 'results.csv'
             n = len(x) + 1  # number of cols
             s = '' if file.exists() else (('%20s,' * n % tuple(['epoch'] + self.keys)).rstrip(',') + '\n')  # add header
             with open(file, 'a') as f:
-                f.write(s + ('%20.5g,' * n % tuple([epoch] + vals)).rstrip(',') + '\n')
+                try:
+                    f.write(s + ('%20.5g,' * n % tuple([epoch] + vals)).rstrip(',') + '\n')
+                except TypeError as e:
+                    print(f"Error during string formatting: {e}")
+                    print(f"Epoch: {epoch}, Vals: {vals}")
+                #f.write(s + ('%20.5g,' * n % tuple([epoch] + vals)).rstrip(',') + '\n')
 
         if self.tb:
             for k, v in x.items():
