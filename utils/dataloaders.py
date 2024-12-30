@@ -29,6 +29,7 @@ from utils.general import (DATASETS_DIR, LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, c
                            check_yaml, clean_str, cv2, is_colab, is_kaggle, segments2boxes, unzip_file, xyn2xy,
                            xywh2xyxy, xywhn2xyxy, xyxy2xywhn)
 from utils.torch_utils import torch_distributed_zero_first
+from utils.rboxs_utils import poly_filter, poly2rbox
 
 # Parameters
 HELP_URL = 'See https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
@@ -99,6 +100,7 @@ def create_dataloader(path,
                       imgsz,
                       batch_size,
                       stride,
+                      names,
                       single_cls=False,
                       hyp=None,
                       augment=False,
@@ -119,6 +121,7 @@ def create_dataloader(path,
     with torch_distributed_zero_first(rank):  # init dataset *.cache only once if DDP
         dataset = LoadImagesAndLabels(
             path,
+            names,
             imgsz,
             batch_size,
             augment=augment,  # augmentation
@@ -434,6 +437,7 @@ class LoadImagesAndLabels(Dataset):
 
     def __init__(self,
                  path,
+                 cls_names,
                  img_size=640,
                  batch_size=16,
                  augment=False,
@@ -456,6 +460,7 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
+        self.cls_names = cls_names
 
         try:
             f = []  # image files
@@ -506,6 +511,7 @@ class LoadImagesAndLabels(Dataset):
         self.shapes = np.array(shapes)
         self.im_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
+        
 
         # Filter images
         if min_items:
@@ -536,6 +542,8 @@ class LoadImagesAndLabels(Dataset):
                     self.segments[i] = segment[j]
             if single_cls:  # single-class training, merge all classes into 0
                 self.labels[i][:, 0] = 0
+                if segment:
+                    self.segments[i][:, 0] = 0
 
         # Rectangular Training
         if self.rect:
@@ -555,9 +563,9 @@ class LoadImagesAndLabels(Dataset):
             for i in range(nb):
                 ari = ar[bi == i]
                 mini, maxi = ari.min(), ari.max()
-                if maxi < 1:
+                if maxi < 1: # batch图像高宽比均小于1时, shape=[h/w, 1] = [h_ratio, w_ratio]
                     shapes[i] = [maxi, 1]
-                elif mini > 1:
+                elif mini > 1: # batch图像高宽比均大于1时, shape=[1, w/h] = [h_ratio, w_ratio]
                     shapes[i] = [1, 1 / mini]
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
@@ -570,8 +578,12 @@ class LoadImagesAndLabels(Dataset):
         if cache_images:
             b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
             self.im_hw0, self.im_hw = [None] * n, [None] * n
+            from concurrent.futures import ThreadPoolExecutor
             fcn = self.cache_images_to_disk if cache_images == 'disk' else self.load_image
-            results = ThreadPool(NUM_THREADS).imap(fcn, range(n))
+            #results = ThreadPool(NUM_THREADS).imap(fcn, range(n))
+            with ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+                results = list(executor.map(lambda idx: self.load_image_label(fcn(idx)), range(n)))
+            
             pbar = tqdm(enumerate(results), total=n, bar_format=TQDM_BAR_FORMAT, disable=LOCAL_RANK > 0)
             for i, x in pbar:
                 if cache_images == 'disk':
@@ -605,7 +617,7 @@ class LoadImagesAndLabels(Dataset):
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f"{prefix}Scanning {path.parent / path.stem}..."
         with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap(verify_image_label, zip(self.im_files, self.label_files, repeat(prefix))),
+            pbar = tqdm(pool.imap(self.verify_image_label, zip(self.im_files, self.label_files, repeat(prefix), repeat(self.cls_names))),
                         desc=desc,
                         total=len(self.im_files),
                         bar_format=TQDM_BAR_FORMAT)
@@ -647,7 +659,17 @@ class LoadImagesAndLabels(Dataset):
     #     return self
 
     def __getitem__(self, index):
+        '''
+        Augment the [clsid poly] labels and trans label format to rbox.
+        Returns:
+            img (tensor): (3, height, width), RGB
+            labels_out (tensor): (n, [None clsid cx cy l s theta gaussian_θ_labels]) θ∈[-pi/2, pi/2)
+            img_file (str): img_dir 
+            shapes : None or [(h_raw, w_raw), (hw_ratios, wh_paddings)], for COCO mAP rescaling
+        '''
         index = self.indices[index]  # linear, shuffled, or image_weights
+        #print(index)
+        #print(type(index))
 
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
@@ -659,19 +681,23 @@ class LoadImagesAndLabels(Dataset):
             # MixUp augmentation
             if random.random() < hyp['mixup']:
                 img, labels = mixup(img, labels, *self.load_mosaic(random.randint(0, self.n - 1)))
-
         else:
             # Load image
-            img, (h0, w0), (h, w) = self.load_image(index)
+            #img, (h0, w0), (h, w) = self.load_image(index)
+            img, (h0, w0), (h, w), img_label = self.load_image_label(index)
 
             # Letterbox
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
 
-            labels = self.labels[index].copy()
+            #labels = self.labels[index].copy()
+            labels = img_label.copy()
+            
             if labels.size:  # normalized xywh to pixel xyxy format
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                #labels[:, 1:] = xywhn2xyxy(labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
+                labels[:, [1, 3, 5, 7]] = img_label[:, [1, 3, 5, 7]] * ratio[0] + pad[0]
+                labels[:, [2, 4, 6, 8]] = img_label[:, [2, 4, 6, 8]] * ratio[1] + pad[1]
 
             if self.augment:
                 img, labels = random_perspective(img,
@@ -683,36 +709,61 @@ class LoadImagesAndLabels(Dataset):
                                                  perspective=hyp['perspective'])
 
         nl = len(labels)  # number of labels
+        """
         if nl:
             labels[:, 1:5] = xyxy2xywhn(labels[:, 1:5], w=img.shape[1], h=img.shape[0], clip=True, eps=1E-3)
-
+        """
         if self.augment:
             # Albumentations
-            img, labels = self.albumentations(img, labels)
-            nl = len(labels)  # update after albumentations
+            #img, labels = self.albumentations(img, labels)
+            #nl = len(labels)  # update after albumentations
 
             # HSV color-space
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
 
+            img_h, img_w = img.shape[0], img.shape[1]
             # Flip up-down
             if random.random() < hyp['flipud']:
                 img = np.flipud(img)
                 if nl:
-                    labels[:, 2] = 1 - labels[:, 2]
+                    #labels[:, 2] = 1 - labels[:, 2]
+                    labels[:, 2::2] = img_h - labels[:, 2::2] - 1
 
             # Flip left-right
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nl:
-                    labels[:, 1] = 1 - labels[:, 1]
+                    #labels[:, 1] = 1 - labels[:, 1]
+                    labels[:, 1::2] = img_w - labels[:, 1::2] - 1
 
             # Cutouts
             # labels = cutout(img, labels, p=0.5)
             # nl = len(labels)  # update after cutout
 
-        labels_out = torch.zeros((nl, 6))
         if nl:
-            labels_out[:, 1:] = torch.from_numpy(labels)
+        # *[clsid poly] to *[clsid cx cy l s theta gaussian_θ_labels] θ∈[-pi/2, pi/2) non-normalized
+            rboxes, csl_labels  = poly2rbox(polys=labels[:, 1:], 
+                                            num_cls_thata=hyp['cls_theta'] if hyp else 180, 
+                                            radius=hyp['csl_radius'] if hyp else 6.0, 
+                                            use_pi=True, use_gaussian=True)
+            labels_obb = np.concatenate((labels[:, :1], rboxes, csl_labels), axis=1)
+            labels_mask = (rboxes[:, 0] >= 0) & (rboxes[:, 0] < img.shape[1]) \
+                        & (rboxes[:, 1] >= 0) & (rboxes[:, 0] < img.shape[0]) \
+                        & (rboxes[:, 2] > 5) | (rboxes[:, 3] > 5)
+            labels_obb = labels_obb[labels_mask]
+            nl = len(labels_obb)  # update after filter
+        
+        if hyp:
+            c_num = 7 + hyp['cls_theta'] # [index_of_batch clsid cx cy l s theta gaussian_θ_labels]
+        else:
+            c_num = 187
+
+        # labels_out = torch.zeros((nl, 6))
+        labels_out = torch.zeros((nl, c_num))
+        
+        if nl:
+            #labels_out[:, 1:] = torch.from_numpy(labels)
+            labels_out[:, 1:] = torch.from_numpy(labels_obb)
 
         # Convert
         img = img.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
@@ -752,7 +803,8 @@ class LoadImagesAndLabels(Dataset):
         random.shuffle(indices)
         for i, index in enumerate(indices):
             # Load image
-            img, _, (h, w) = self.load_image(index)
+            #img, _, (h, w) = self.load_image(index)
+            img, _, (h, w), img_label = self.load_image_label(index)
 
             # place img in img4
             if i == 0:  # top left
@@ -774,17 +826,25 @@ class LoadImagesAndLabels(Dataset):
             padh = y1a - y1b
 
             # Labels
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            #labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            labels, segments = img_label.copy(), self.segments[index].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
             if labels.size:
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                #labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)  # normalized xywh to pixel xyxy format
+                labels[:, [1, 3, 5, 7]] = img_label[:, [1, 3, 5, 7]] + padw
+                labels[:, [2, 4, 6, 8]] = img_label[:, [2, 4, 6, 8]] + padh
                 segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
             labels4.append(labels)
             segments4.extend(segments)
 
         # Concat/clip labels
         labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
+        #for x in (labels4[:, 1:], *segments4):
+        for x in (segments4):
             np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        h_filter = 2 * s
+        w_filter = 2 * s
+        labels_mask = poly_filter(polys=labels4[:, 1:].copy(), h=h_filter, w=w_filter)
+        labels4 = labels4[labels_mask]
         # img4, labels4 = replicate(img4, labels4)  # replicate
 
         # Augment
@@ -810,7 +870,8 @@ class LoadImagesAndLabels(Dataset):
         hp, wp = -1, -1  # height, width previous
         for i, index in enumerate(indices):
             # Load image
-            img, _, (h, w) = self.load_image(index)
+            #img, _, (h, w) = self.load_image(index)
+            img, _, (h, w), img_label = self.load_image_label(self, index)
 
             # place img in img9
             if i == 0:  # center
@@ -838,10 +899,16 @@ class LoadImagesAndLabels(Dataset):
             x1, y1, x2, y2 = (max(x, 0) for x in c)  # allocate coords
 
             # Labels
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            #labels, segments = self.labels[index].copy(), self.segments[index].copy()
+            labels, segments = img_label.copy(), self.segments[index].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
             if labels.size:
-                labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
+                #labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padx, pady)  # normalized xywh to pixel xyxy format
                 segments = [xyn2xy(x, w, h, padx, pady) for x in segments]
+                labels_ = labels.clone() if isinstance(labels, torch.Tensor) else np.copy(labels)
+                labels_[:, [1, 3, 5, 7]] = labels[:, [1, 3, 5, 7]] + padx
+                labels_[:, [2, 4, 6, 8]] = labels[:, [2, 4, 6, 8]] + pady
+                labels = labels_
+
             labels9.append(labels)
             segments9.extend(segments)
 
@@ -855,17 +922,25 @@ class LoadImagesAndLabels(Dataset):
 
         # Concat/clip labels
         labels9 = np.concatenate(labels9, 0)
-        labels9[:, [1, 3]] -= xc
-        labels9[:, [2, 4]] -= yc
+        #labels9[:, [1, 3]] -= xc
+        #labels9[:, [2, 4]] -= yc
+        labels9[:, [1, 3, 5, 7]] -= xc
+        labels9[:, [2, 4, 6, 8]] -= yc
+
         c = np.array([xc, yc])  # centers
         segments9 = [x - c for x in segments9]
 
-        for x in (labels9[:, 1:], *segments9):
+        #for x in (labels9[:, 1:], *segments9):
+        for x in (segments9):
             np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+        h_filter = 2 * s
+        w_filter = 2 * s
+        labels_mask = poly_filter(polys=labels9[:, 1:].copy(), h=h_filter, w=w_filter)
+        labels9 = labels9[labels_mask]
         # img9, labels9 = replicate(img9, labels9)  # replicate
 
         # Augment
-        img9, labels9, segments9 = copy_paste(img9, labels9, segments9, p=self.hyp['copy_paste'])
+        #img9, labels9, segments9 = copy_paste(img9, labels9, segments9, p=self.hyp['copy_paste'])
         img9, labels9 = random_perspective(img9,
                                            labels9,
                                            segments9,
@@ -910,9 +985,147 @@ class LoadImagesAndLabels(Dataset):
             lb[:, 0] = i  # add target image index for build_targets()
 
         return torch.stack(im4, 0), torch.cat(label4, 0), path4, shapes4
+    
+    def load_image_label(self, i):
+        # loads 1 image from dataset index 'i', returns im, original hw, resized hw
+        im = self.ims[i]
+        label = self.labels[i].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
+        if im is None:  # not cached in ram
+            npy = self.npy_files[i]
+            if npy and npy.exists():  # load npy
+                im = np.load(npy)
+            else:  # read image
+                path = self.im_files[i]
+                im = cv2.imread(path)  # BGR
+                assert im is not None, f'Image Not Found {path}'
+            h0, w0 = im.shape[:2]  # orig hw
+            r = self.img_size / max(h0, w0)  # ratio
+            if r != 1:  # if sizes are not equal
+                im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
+                                interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+                label[:, 1:] *= r
+            return im, (h0, w0), im.shape[:2], label  # im, hw_original, hw_resized, resized_label
+        else:
+            return self.ims[i], self.im_hw0[i], self.im_hw[i], self.labels[i]  # im, hw_original, hw_resized, resized_label
+        
+    def verify_image_label(self, args):
+        # Verify one image-label pair
+        #im_file, lb_file, prefix = args
+
+        im_file, lb_file, prefix, cls_name_list = args
+        nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
+        print(im_file, lb_file, prefix, cls_name_list)
+        try:
+            # verify images
+            im = Image.open(im_file)
+            im.verify()  # PIL verify
+            shape = exif_size(im)  # image size
+            assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+            assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+            if im.format.lower() in ('jpg', 'jpeg'):
+                with open(im_file, 'rb') as f:
+                    f.seek(-2, 2)
+                    if f.read() != b'\xff\xd9':  # corrupt JPEG
+                        ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                        msg = f'{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved'
+
+            # verify labels
+            if os.path.isfile(lb_file):
+                nf = 1  # label found
+                with open(lb_file) as f:
+                    labels = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                    
+                    # Yolov9-obb does not support segment labels yet
+                    """
+                    if any(len(x) > 6 for x in lb):  # is segment
+                        classes = np.array([x[0] for x in lb], dtype=np.float32)
+                        segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
+                        lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                    """
+                    #lb = np.array(lb, dtype=np.float32)
+                    l_ = []
+                    for label in labels:
+                        if label[-1] == "2": # diffcult
+                            continue
+                        class_name = label[8]  # Extract class name from label
+                        print(f"Label: {label}")
+                        print(f"Class name: {class_name}") 
+                        # Reverse lookup: Find the class ID corresponding to the class name
+                        cls_id = None
+                        for key, value in cls_name_list.items():
+                            if value == class_name:
+                                cls_id = key
+                                break
+
+                        if cls_id is None:
+                            print(f"Warning: Class name '{class_name}' not found in cls_name_list")
+                        else:
+                            print(f"Class ID for {class_name} is {cls_id}")
+                        #cls_id = cls_name_list.index(label[8])
+                        coords = np.array(label[:8], dtype=np.float32)
+                        #l_.append(np.concatenate((cls_id, label[:8]), axis=None))
+                        l_.append(np.concatenate(([cls_id], coords)))
+                    l = np.array(l_, dtype=np.float32)
+                #nl = len(lb)
+                nl = len(l)
+                if nl:
+                    #assert lb.shape[1] == 5, f'labels require 5 columns, {lb.shape[1]} columns detected'
+                    #assert (lb >= 0).all(), f'negative label values {lb[lb < 0]}'
+                    #assert (lb[:, 1:] <= 1).all(), f'non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}'
+                    assert len(label) == 10, f'Yolov9-OBB labels require 10 columns, which same as DOTA Dataset, {len(label)} columns detected'
+                    assert (l >= 0).all(), f'negative label values {l[l < 0]}, please check your dota format labels'
+                    
+                    #_, i = np.unique(lb, axis=0, return_index=True)
+                    _, i = np.unique(l, axis=0, return_index=True)
+                    if len(i) < nl:  # duplicate row check
+                        #lb = lb[i]  # remove duplicates
+                        l = l[i]
+                        if segments:
+                            #segments = [segments[x] for x in i]
+                            segments = segments[i]
+                        msg = f'{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed'
+                else:
+                    ne = 1  # label empty
+                    #lb = np.zeros((0, 5), dtype=np.float32)
+                    l = np.zeros((0, 9), dtype=np.float32)
+            else:
+                nm = 1  # label missing
+                #lb = np.zeros((0, 5), dtype=np.float32)
+                l = np.zeros((0, 9), dtype=np.float32)
+            #return im_file, lb, shape, segments, nm, nf, ne, nc, msg
+            return im_file, l, shape, segments, nm, nf, ne, nc, msg
+        
+        except Exception as e:
+            nc = 1
+            msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
+            return [None, None, None, None, nm, nf, ne, nc, msg]
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
+"""
+def load_image_label(self, i):
+    # loads 1 image from dataset index 'i', returns im, original hw, resized hw
+    im = self.imgs[i]
+    label = self.labels[i].copy() # labels (array): (num_gt_perimg, [cls_id, poly])
+    if im is None:  # not cached in ram
+        npy = self.img_npy[i]
+        if npy and npy.exists():  # load npy
+            im = np.load(npy)
+        else:  # read image
+            path = self.img_files[i]
+            im = cv2.imread(path)  # BGR
+            assert im is not None, f'Image Not Found {path}'
+        h0, w0 = im.shape[:2]  # orig hw
+        r = self.img_size / max(h0, w0)  # ratio
+        if r != 1:  # if sizes are not equal
+            im = cv2.resize(im, (int(w0 * r), int(h0 * r)),
+                            interpolation=cv2.INTER_AREA if r < 1 and not self.augment else cv2.INTER_LINEAR)
+            label[:, 1:] *= r
+        return im, (h0, w0), im.shape[:2], label  # im, hw_original, hw_resized, resized_label
+    else:
+        return self.imgs[i], self.img_hw0[i], self.img_hw[i], self.labels[i]  # im, hw_original, hw_resized, resized_label
+"""
+
 def flatten_recursive(path=DATASETS_DIR / 'coco128'):
     # Flatten a recursive directory by bringing all files to top level
     new_path = Path(f'{str(path)}_flat')
@@ -982,10 +1195,11 @@ def autosplit(path=DATASETS_DIR / 'coco128/images', weights=(0.9, 0.1, 0.0), ann
             with open(path.parent / txt[i], 'a') as f:
                 f.write(f'./{img.relative_to(path.parent).as_posix()}' + '\n')  # add image to txt file
 
-
+'''
 def verify_image_label(args):
     # Verify one image-label pair
-    im_file, lb_file, prefix = args
+    #im_file, lb_file, prefix = args
+    im_file, lb_file, prefix, cls_name_list = args
     nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
     try:
         # verify images
@@ -1006,34 +1220,55 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                
+                # Yolov9-obb does not support segment labels yet
+                """
                 if any(len(x) > 6 for x in lb):  # is segment
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
                     lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
-                lb = np.array(lb, dtype=np.float32)
-            nl = len(lb)
+                """
+                #lb = np.array(lb, dtype=np.float32)
+                l_ = []
+                for label in lb:
+                    if label[-1] == "2": # diffcult
+                        continue
+                    cls_id = cls_name_list.index(label[8])
+                    l_.append(np.concatenate((cls_id, label[:8]), axis=None))
+                l = np.array(l_, dtype=np.float32)
+            #nl = len(lb)
+            nl = len(l)
             if nl:
-                assert lb.shape[1] == 5, f'labels require 5 columns, {lb.shape[1]} columns detected'
-                assert (lb >= 0).all(), f'negative label values {lb[lb < 0]}'
-                assert (lb[:, 1:] <= 1).all(), f'non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}'
+                #assert lb.shape[1] == 5, f'labels require 5 columns, {lb.shape[1]} columns detected'
+                #assert (lb >= 0).all(), f'negative label values {lb[lb < 0]}'
+                #assert (lb[:, 1:] <= 1).all(), f'non-normalized or out of bounds coordinates {lb[:, 1:][lb[:, 1:] > 1]}'
+                assert len(label) == 10, f'Yolov9-OBB labels require 10 columns, which same as DOTA Dataset, {len(label)} columns detected'
+                assert (l >= 0).all(), f'negative label values {l[l < 0]}, please check your dota format labels'
+                
                 _, i = np.unique(lb, axis=0, return_index=True)
                 if len(i) < nl:  # duplicate row check
-                    lb = lb[i]  # remove duplicates
+                    #lb = lb[i]  # remove duplicates
+                    l = l[i]
                     if segments:
-                        segments = [segments[x] for x in i]
+                        #segments = [segments[x] for x in i]
+                        segments = segments[i]
                     msg = f'{prefix}WARNING ⚠️ {im_file}: {nl - len(i)} duplicate labels removed'
             else:
                 ne = 1  # label empty
-                lb = np.zeros((0, 5), dtype=np.float32)
+                #lb = np.zeros((0, 5), dtype=np.float32)
+                l = np.zeros((0, 9), dtype=np.float32)
         else:
             nm = 1  # label missing
-            lb = np.zeros((0, 5), dtype=np.float32)
-        return im_file, lb, shape, segments, nm, nf, ne, nc, msg
+            #lb = np.zeros((0, 5), dtype=np.float32)
+            l = np.zeros((0, 9), dtype=np.float32)
+        #return im_file, lb, shape, segments, nm, nf, ne, nc, msg
+        return im_file, l, shape, segments, nm, nf, ne, nc, msg
+    
     except Exception as e:
         nc = 1
         msg = f'{prefix}WARNING ⚠️ {im_file}: ignoring corrupt image/label: {e}'
         return [None, None, None, None, nm, nf, ne, nc, msg]
-
+'''
 
 class HUBDatasetStats():
     """ Class for generating HUB dataset JSON and `-hub` dataset directory

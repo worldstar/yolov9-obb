@@ -34,6 +34,9 @@ import yaml
 from utils import TryExcept, emojis
 from utils.downloads import gsutil_getsize
 from utils.metrics import box_iou, fitness
+pi = 3.141592
+from utils.nms_rotated import obb_nms
+
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLO root directory
@@ -781,7 +784,8 @@ def xywhn2xyxy(x, w=640, h=640, padw=0, padh=0):
 def xyxy2xywhn(x, w=640, h=640, clip=False, eps=0.0):
     # Convert nx4 boxes from [x1, y1, x2, y2] to [x, y, w, h] normalized where xy1=top-left, xy2=bottom-right
     if clip:
-        clip_boxes(x, (h - eps, w - eps))  # warning: inplace clip
+        clip_coords(x, (h - eps, w - eps))  # warning: inplace clip
+        #clip_boxes(x, (h - eps, w - eps))  # warning: inplace clip
     y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
     y[..., 0] = ((x[..., 0] + x[..., 2]) / 2) / w  # x center
     y[..., 1] = ((x[..., 1] + x[..., 3]) / 2) / h  # y center
@@ -825,6 +829,56 @@ def resample_segments(segments, n=1000):
     return segments
 
 
+def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
+    # Rescale coords (xyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = old / new
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0]
+        pad = ratio_pad[1]
+
+    coords[:, [0, 2]] -= pad[0]  # x padding
+    coords[:, [1, 3]] -= pad[1]  # y padding
+    coords[:, :4] /= gain
+    clip_boxes(coords, img0_shape)
+    return coords
+
+# ------------------------------------------------------------------------------------------------------------------
+# OBB-related
+def scale_polys(img1_shape, polys, img0_shape, ratio_pad=None):
+    # ratio_pad: [(h_raw, w_raw), (hw_ratios, wh_paddings)]
+    # Rescale coords (xyxyxyxy) from img1_shape to img0_shape
+    if ratio_pad is None:  # calculate from img0_shape
+        gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])  # gain  = resized / raw
+        pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2  # wh padding
+    else:
+        gain = ratio_pad[0][0] # h_ratios
+        pad = ratio_pad[1] # wh_paddings
+
+    polys[:, [0, 2, 4, 6]] -= pad[0]  # x padding
+    polys[:, [1, 3, 5, 7]] -= pad[1]  # y padding
+    polys[:, :8] /= gain # Rescale poly shape to img0_shape
+    #clip_polys(polys, img0_shape)
+    return polys
+
+# OBB-related
+def clip_polys(polys, shape):
+    # Clip bounding xyxyxyxy bounding boxes to image shape (height, width)
+    if isinstance(polys, torch.Tensor):  # faster individually
+        polys[:, 0].clamp_(0, shape[1])  # x1
+        polys[:, 1].clamp_(0, shape[0])  # y1
+        polys[:, 2].clamp_(0, shape[1])  # x2
+        polys[:, 3].clamp_(0, shape[0])  # y2
+        polys[:, 4].clamp_(0, shape[1])  # x3
+        polys[:, 5].clamp_(0, shape[0])  # y3
+        polys[:, 6].clamp_(0, shape[1])  # x4
+        polys[:, 7].clamp_(0, shape[0])  # y4
+    else:  # np.array (faster grouped)
+        polys[:, [0, 2, 4, 6]] = polys[:, [0, 2, 4, 6]].clip(0, shape[1])  # x1, x2, x3, x4
+        polys[:, [1, 3, 5, 7]] = polys[:, [1, 3, 5, 7]].clip(0, shape[0])  # y1, y2, y3, y4
+
+# ------------------------------------------------------------------------------------------------------------------
 def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
     # Rescale boxes (xyxy) from img1_shape to img0_shape
     if ratio_pad is None:  # calculate from img0_shape
@@ -837,9 +891,9 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
     boxes[:, [0, 2]] -= pad[0]  # x padding
     boxes[:, [1, 3]] -= pad[1]  # y padding
     boxes[:, :4] /= gain
+    #clip_boxes(boxes, img0_shape)
     clip_boxes(boxes, img0_shape)
     return boxes
-
 
 def scale_segments(img1_shape, segments, img0_shape, ratio_pad=None, normalize=False):
     # Rescale coords (xyxy) from img1_shape to img0_shape
@@ -859,7 +913,6 @@ def scale_segments(img1_shape, segments, img0_shape, ratio_pad=None, normalize=F
         segments[:, 1] /= img0_shape[0]  # height
     return segments
 
-
 def clip_boxes(boxes, shape):
     # Clip boxes (xyxy) to image shape (height, width)
     if isinstance(boxes, torch.Tensor):  # faster individually
@@ -870,7 +923,6 @@ def clip_boxes(boxes, shape):
     else:  # np.array (faster grouped)
         boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, shape[1])  # x1, x2
         boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, shape[0])  # y1, y2
-
 
 def clip_segments(segments, shape):
     # Clip segments (xy1,xy2,...) to image shape (height, width)
@@ -900,7 +952,7 @@ def non_max_suppression(
     """
 
     if isinstance(prediction, (list, tuple)):  # YOLO model in validation model, output = (inference_out, loss_out)
-        prediction = prediction[0]  # select only inference output
+        prediction = prediction[0][1]  # select only inference output
 
     device = prediction.device
     mps = 'mps' in device.type  # Apple MPS
@@ -993,6 +1045,137 @@ def non_max_suppression(
 
     return output
 
+# OBB-related
+def non_max_suppression_obb(
+    prediction, 
+    conf_thres=0.25, 
+    iou_thres=0.45, 
+    classes=None, 
+    agnostic=False, 
+    multi_label=False,
+    labels=(), 
+    max_det=1500, # or 300
+    nm=0):# number of masks
+    """Runs Non-Maximum Suppression (NMS) on inference results_obb
+    Args:
+        prediction (tensor): (b, n_all_anchors, [cx cy l s obj num_cls theta_cls])
+        agnostic (bool): True = NMS will be applied between elements of different categories
+        labels : () or
+
+    Returns:
+        list of detections, len=batch_size, on (n,7) tensor per image [xylsθ, conf, cls] θ ∈ [-pi/2, pi/2)
+    """
+    #print(f"prediction type: {type(prediction)}")
+   
+    if isinstance(prediction, (list, tuple)):  # YOLO model in validation model, output = (inference_out, loss_out)
+        prediction = prediction[0][1]  # select only inference output
+
+    device = prediction.device
+    mps = 'mps' in device.type  # Apple MPS
+    if mps:  # MPS not fully supported yet, convert tensors to CPU before NMS
+        prediction = prediction.cpu()
+    bs = prediction.shape[0]  # batch size
+    nc = prediction.shape[1] - nm - 4  # number of classes
+    #mi = 4 + nc  # mask start index
+    #xc = prediction[:, 4:mi].amax(1) > conf_thres  # candidates
+    
+    #nc = prediction.shape[2] - 5 - 180  # number of classes
+    xc = prediction[..., 4] > conf_thres  # candidates
+    class_index = nc + 5
+    
+    print(f"prediction number: {len(prediction)}")
+    print(f"The shape of xc: {xc.shape}")
+
+    # Checks
+    assert 0 <= conf_thres <= 1, f'Invalid Confidence threshold {conf_thres}, valid values are between 0.0 and 1.0'
+    assert 0 <= iou_thres <= 1, f'Invalid IoU {iou_thres}, valid values are between 0.0 and 1.0'
+
+    # Settings
+    max_wh = 7680 # min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
+    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
+    time_limit = 2.5 + 0.05 * bs   # seconds to quit after
+    redundant = True  # require redundant detections
+    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
+    merge = False  # use merge-NMS
+    
+    t = time.time()
+    output = [torch.zeros((0, 7 + nm), device=prediction.device)] * prediction.shape[0]
+    for xi, x in enumerate(prediction):  # image index, image inference
+        # Apply constraints
+        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
+        x = x[xc[xi]]  # confidence, (tensor): (n_conf_thres, [cx cy l s obj num_cls theta_cls])
+
+        #print(f"x.shape: {x.shape}")
+        #print(f"class_index: {class_index}")
+        #print(f"x[:, class_index:].shape: {x[:, class_index:].shape}")
+        
+        # Cat apriori labels if autolabelling
+        if labels and len(labels[xi]):
+            lb = labels[xi]
+            v = torch.zeros((len(lb), nc + nm + 5), device=x.device)
+            v[:, :4] = lb[:, 1:5]  # box
+            #v[:, 4] = 1.0  # conf
+            v[range(len(lb)), lb[:, 0].long() + 5] = 1.0  # cls
+            x = torch.cat((x, v), 0)
+
+        # If none remain process next image
+        if not x.shape[0]:
+            continue
+        
+        # Compute conf
+        x[:, 5:class_index] *= x[:, 4:5]  # conf = obj_conf * cls_conf
+        
+        # Ensure the index is valid
+        if x.shape[1] > class_index:
+            _, theta_pred = torch.max(x[:, class_index:], 1, keepdim=True)  # [n_conf_thres, 1] θ ∈ int[0, 179]
+            theta_pred = (theta_pred - 90) / 180 * pi  # Convert to radians θ ∈ [-pi/2, pi/2)
+        else:
+            theta_pred = torch.zeros((x.shape[0], 1), device=x.device)  # Default theta prediction
+        
+
+        #_, theta_pred = torch.max(x[:, class_index:], 1,  keepdim=True) # [n_conf_thres, 1] θ ∈ int[0, 179]
+        #theta_pred = (theta_pred - 90) / 180 * pi # [n_conf_thres, 1] θ ∈ [-pi/2, pi/2)
+
+        # Detections matrix nx7 (xyls, θ, conf, cls) θ ∈ [-pi/2, pi/2)
+        if multi_label:
+            i, j = (x[:, 5:class_index] > conf_thres).nonzero(as_tuple=False).T # ()
+            x = torch.cat((x[i, :4], theta_pred[i], x[i, j + 5, None], j[:, None].float()), 1)
+        else:  # best class only
+            conf, j = x[:, 5:class_index].max(1, keepdim=True)
+            x = torch.cat((x[:, :4], theta_pred, conf, j.float()), 1)[conf.view(-1) > conf_thres]
+
+        # Filter by class
+        if classes is not None:
+            x = x[(x[:, 6:7] == torch.tensor(classes, device=x.device)).any(1)]
+
+        # Apply finite constraint
+        # if not torch.isfinite(x).all():
+        #     x = x[torch.isfinite(x).all(1)]
+
+        # Check shape
+        n = x.shape[0]  # number of boxes
+        if not n:  # no boxes
+            continue
+        elif n > max_nms:  # excess boxes
+            x = x[x[:, 5].argsort(descending=True)[:max_nms]]  # sort by confidence
+        else:
+            x = x[x[:, 4].argsort(descending=True)]  # sort by confidence
+
+        # Batched NMS
+        c = x[:, 6:7] * (0 if agnostic else max_wh)  # classes
+        rboxes = x[:, :5].clone() 
+        rboxes[:, :2] = rboxes[:, :2] + c # rboxes (offset by class)
+        scores = x[:, 5]  # scores
+        _, i = obb_nms(rboxes, scores, iou_thres)
+        if i.shape[0] > max_det:  # limit detections
+            i = i[:max_det]
+
+        output[xi] = x[i]
+        if (time.time() - t) > time_limit:
+            print(f'WARNING: NMS time limit {time_limit}s exceeded')
+            break  # time limit exceeded
+
+    return output
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
@@ -1013,7 +1196,9 @@ def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_op
 def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve: ')):
     evolve_csv = save_dir / 'evolve.csv'
     evolve_yaml = save_dir / 'hyp_evolve.yaml'
-    keys = tuple(keys) + tuple(hyp.keys())  # [results + hyps]
+    keys = ('metrics/precision', 'metrics/recall', 'metrics/HBBmAP.5', 'metrics/HBBmAP.5:.95',
+            'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/theta_loss') + tuple(hyp.keys())  # [results + hyps]
+    #keys = tuple(keys) + tuple(hyp.keys())  # [results + hyps]
     keys = tuple(x.strip() for x in keys)
     vals = results + tuple(hyp.values())
     n = len(keys)
@@ -1033,7 +1218,8 @@ def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve
     with open(evolve_yaml, 'w') as f:
         data = pd.read_csv(evolve_csv)
         data = data.rename(columns=lambda x: x.strip())  # strip keys
-        i = np.argmax(fitness(data.values[:, :4]))  #
+        i = np.argmax(fitness(data.values[:, :7])) 
+        #i = np.argmax(fitness(data.values[:, :4]))  #
         generations = len(data)
         f.write('# YOLO Hyperparameter Evolution Results\n' + f'# Best generation: {i}\n' +
                 f'# Last generation: {generations - 1}\n' + '# ' + ', '.join(f'{x.strip():>20s}' for x in keys[:7]) +
@@ -1064,7 +1250,8 @@ def apply_classifier(x, model, img, im0):
             d[:, :4] = xywh2xyxy(b).long()
 
             # Rescale boxes from img_size to im0 size
-            scale_boxes(img.shape[2:], d[:, :4], im0[i].shape)
+            #scale_boxes(img.shape[2:], d[:, :4], im0[i].shape)
+            scale_coords(img.shape[2:], d[:, :4], im0[i].shape)
 
             # Classes
             pred_cls1 = d[:, 5].long()
